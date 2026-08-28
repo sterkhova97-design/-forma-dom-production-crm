@@ -1,0 +1,22 @@
+FORMA DOM calculator v3.1 — что добавить для структурированной истории КП
+
+В Tilda создайте 2 скрытых поля:
+1) RequestId
+2) ItemsJson
+
+В функции submitToTilda(payload), рядом с существующими setField(...), добавить:
+
+setField(form, 'RequestId', payload.requestId);
+setField(form, 'ItemsJson', JSON.stringify(payload.items || []));
+
+Существующие строки уже передают:
+setField(form, 'Configuration', payload.configuration);
+setField(form, 'Total', payload.totalPrice);
+
+Но для CRM нужен именно ItemsJson, иначе список изделий приходится восстанавливать
+из текстовой Configuration.
+
+Важно:
+само наличие ItemsJson в Tilda ещё не делает безопасный API истории КП.
+CRM не должна хранить API-ключ Tilda в браузере. Реальную выдачу истории нужно
+делать через серверный endpoint /api/kp (Cloudflare Worker / Apps Script / ваш backend).
