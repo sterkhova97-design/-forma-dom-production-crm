@@ -1,35 +1,19 @@
 
-const KP_API_URL = ""; // production: URL вида https://.../api/kp
-const STORAGE_KEY = "formaDomProductionCRM.v1";
-const STATUS = ["Каркас","Паралонка","Пошив","Обивка","Готов к отгрузке","Отгружен"];
+const KP_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwSvtr0hpyQjqsm4CEM3ZawXCAsMqJ7Ai2CbAEIwSoQCbQCH_xSRSbmj2lauIgOyygj/exec"; 
+// После публикации Google Apps Script сюда вставляется URL вида:
+// https://script.google.com/macros/s/XXXXXXXX/exec
 
-const demoKp = [
-  {
-    id:"КП-2026-081", date:"2026-08-25", client:"Проект Ордынка", manager:"Екатерина",
-    items:[
-      {id:"kp81-1", name:"Диван Nube", qty:1, image:""},
-      {id:"kp81-2", name:"Кресло Core", qty:2, image:""}
-    ]
-  },
-  {
-    id:"КП-2026-079", date:"2026-08-22", client:"Квартира Садовые кварталы", manager:"Анна",
-    items:[
-      {id:"kp79-1", name:"Кровать LO-RA", qty:1, image:""},
-      {id:"kp79-2", name:"Банкетка", qty:1, image:""}
-    ]
-  },
-  {
-    id:"КП-2026-074", date:"2026-08-17", client:"Загородный дом", manager:"Екатерина",
-    items:[
-      {id:"kp74-1", name:"Диван Sora", qty:1, image:""}
-    ]
-  }
-];
+const STORAGE_KEY = "formaDomProductionCRM.v2";
+const STATUS = ["Каркас","Паралонка","Пошив","Обивка","Готов к отгрузке","Отгружен"];
 
 let state = {
   tab:"work",
   items:[],
-  kp:demoKp,
+  kp:[],
+  kpLoading:false,
+  kpError:"",
+  openedKp:null,
+  openedKpLoading:false,
   modal:null,
   draftOrder:null,
   draftIndex:0,
@@ -74,15 +58,58 @@ function isArchived(item){
 function visibleItems(){
   return state.items.filter(x=>state.tab==="archive" ? isArchived(x) : !isArchived(x));
 }
+function jsonp(params){
+  return new Promise((resolve,reject)=>{
+    if(!KP_WEBAPP_URL){
+      reject(new Error("Не указан URL Google Apps Script"));
+      return;
+    }
+    const cb="fdcrm_"+Date.now()+"_"+Math.random().toString(36).slice(2);
+    const script=document.createElement("script");
+    const timeout=setTimeout(()=>{
+      cleanup();
+      reject(new Error("Нет ответа от Google Apps Script"));
+    },20000);
+
+    function cleanup(){
+      clearTimeout(timeout);
+      try{delete window[cb]}catch{}
+      script.remove();
+    }
+
+    window[cb]=(data)=>{
+      cleanup();
+      if(data && data.ok===false) reject(new Error(data.error||"Ошибка Apps Script"));
+      else resolve(data);
+    };
+
+    const q=new URLSearchParams({...params,callback:cb,_:Date.now()});
+    script.src=KP_WEBAPP_URL+(KP_WEBAPP_URL.includes("?")?"&":"?")+q.toString();
+    script.onerror=()=>{
+      cleanup();
+      reject(new Error("Не удалось загрузить данные КП"));
+    };
+    document.head.appendChild(script);
+  });
+}
+
 async function loadKp(){
-  if(!KP_API_URL) return;
+  if(!KP_WEBAPP_URL){
+    state.kp=[];
+    state.kpError="CRM ещё не подключена к Google Apps Script.";
+    return;
+  }
+  state.kpLoading=true;
+  state.kpError="";
+  render();
   try{
-    const r=await fetch(KP_API_URL,{credentials:"include"});
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    const data=await r.json();
-    if(Array.isArray(data)) state.kp=data;
+    const data=await jsonp({action:"list"});
+    state.kp=Array.isArray(data?.items)?data.items:[];
   }catch(e){
-    console.warn("KP API недоступен, показана тестовая история.",e);
+    state.kpError=e.message||String(e);
+  }finally{
+    state.kpLoading=false;
+    render();
   }
 }
 function toast(text){
@@ -151,7 +178,12 @@ function rowHtml(item){
   </tr>`;
 }
 function setTab(tab){ state.tab=tab; render(); }
-function openKp(){ state.modal="kp"; render(); }
+function openKp(){
+  state.modal="kp";
+  state.openedKp=null;
+  render();
+  if(!state.kp.length && !state.kpLoading) loadKp();
+}
 function closeModal(){ state.modal=null; state.draftOrder=null; state.specItemId=null; render(); }
 function modalHtml(){
   if(state.modal==="kp") return kpModal();
@@ -164,22 +196,123 @@ function kpModal(){
     <div class="modal">
       <div class="modal-head"><h2>Добавить заказ</h2><button class="modal-close" onclick="closeModal()">×</button></div>
       <div class="modal-body">
-        <div class="progress-note">Выберите изделия из истории КП калькулятора.</div>
-        <div class="kp-list">${state.kp.map(kp=>`
-          <div class="kp-row">
-            <div class="kp-head">
-              <div><strong>${esc(kp.id)}</strong><div class="kp-meta">${formatDate(kp.date)} · ${esc(kp.client||"Без клиента")} · ${esc(kp.manager||"")}</div></div>
-            </div>
-            <div class="kp-items">
-              ${kp.items.map(i=>`<label class="kp-item"><input type="checkbox" data-kp="${esc(kp.id)}" data-item="${esc(i.id)}"> <strong>${esc(i.name)}</strong> <span class="kp-meta">${i.qty||1} шт.</span></label>`).join("")}
-            </div>
-            <div style="margin-top:12px"><button class="crm-btn small primary" onclick="startOrder('${esc(kp.id)}')">Продолжить с выбранными</button></div>
-          </div>`).join("")}
-        </div>
+        ${state.openedKp ? openedKpHtml() : kpHistoryHtml()}
       </div>
     </div>
   </div>`;
 }
+
+function kpHistoryHtml(){
+  if(state.kpLoading) return `<div class="empty">Загружаю историю КП…</div>`;
+  if(state.kpError) return `<div class="empty"><strong>Не удалось загрузить историю КП</strong><br><br>${esc(state.kpError)}<br><br><button class="crm-btn" onclick="loadKp()">Повторить</button></div>`;
+  if(!state.kp.length) return `<div class="empty">В истории пока нет КП.</div>`;
+
+  return `
+    <div class="progress-note">История КП из рабочего калькулятора Forma Dom. Откройте нужное КП и выберите изделия для производства.</div>
+    <div class="kp-history">
+      <div class="kp-history-head">
+        <div>Дата</div><div>Клиент / проект</div><div>Менеджер</div><div></div>
+      </div>
+      ${state.kp.map(kp=>`
+        <div class="kp-history-row">
+          <div>${esc(kp.created_at||kp.updated_at||"—")}</div>
+          <div><strong>${esc(kp.client_name||kp.kp_name||"Без названия")}</strong>${kp.project_name?`<div class="kp-meta">${esc(kp.project_name)}</div>`:""}</div>
+          <div>${esc(kp.manager||"—")}</div>
+          <div><button class="crm-btn small primary" onclick="openKpDetails('${esc(kp.kp_id)}')">Открыть</button></div>
+        </div>`).join("")}
+    </div>`;
+}
+
+async function openKpDetails(kpId){
+  state.openedKpLoading=true;
+  state.openedKp={header:{kp_id:kpId},items:[]};
+  render();
+  try{
+    const data=await jsonp({action:"get",kpId});
+    state.openedKp=data?.kp||null;
+    if(!state.openedKp) throw new Error("КП не найдено");
+  }catch(e){
+    state.openedKp=null;
+    state.kpError=e.message||String(e);
+    toast("Не удалось открыть КП");
+  }finally{
+    state.openedKpLoading=false;
+    render();
+  }
+}
+
+function backToKpHistory(){
+  state.openedKp=null;
+  render();
+}
+
+function openedKpHtml(){
+  if(state.openedKpLoading) return `<div class="empty">Открываю КП…</div>`;
+  const kp=state.openedKp;
+  if(!kp) return "";
+  const h=kp.header||{};
+  const items=kp.items||[];
+  return `
+    <button class="link-btn" onclick="backToKpHistory()">← Назад к истории КП</button>
+    <div class="kp-open-title">
+      <h3>${esc(h.client_name||h.kp_name||"КП")}</h3>
+      <div class="kp-meta">${esc(h.manager||"")} ${h.project_name?`· ${esc(h.project_name)}`:""}</div>
+    </div>
+    <div class="progress-note">Выберите изделия, которые нужно передать в производство.</div>
+    <div class="kp-selected-items">
+      ${items.map((i,idx)=>`
+        <label class="kp-item kp-item-large">
+          <input type="checkbox" data-open-item="${idx}">
+          ${firstImage(i.values)?`<img class="product-img" src="${firstImage(i.values)}">`:`<div class="product-img product-placeholder">нет фото</div>`}
+          <span><strong>${esc(i.productName||"Изделие")}</strong><small>${Number(i.summary?.quantity||1)} шт.</small></span>
+        </label>`).join("")}
+    </div>
+    <div style="margin-top:18px">
+      <button class="crm-btn primary" onclick="startOrderFromOpenedKp()">Продолжить с выбранными</button>
+    </div>`;
+}
+
+function firstImage(obj){
+  const found=[];
+  function walk(v){
+    if(found.length) return;
+    if(typeof v==="string" && (/^data:image\//.test(v) || /^https?:\/\/.+\.(png|jpe?g|webp)(\?|$)/i.test(v) || /drive\.google\.com/.test(v))) found.push(v);
+    else if(v && typeof v==="object") Object.values(v).forEach(walk);
+  }
+  walk(obj);
+  return found[0]||"";
+}
+
+function startOrderFromOpenedKp(){
+  const kp=state.openedKp;
+  const indexes=[...document.querySelectorAll("[data-open-item]:checked")].map(x=>Number(x.dataset.openItem));
+  if(!indexes.length){toast("Выберите хотя бы одно изделие");return;}
+  const picked=(kp.items||[]).filter((_,idx)=>indexes.includes(idx));
+  const h=kp.header||{};
+  state.draftOrder={
+    kpId:h.kp_id||"",
+    client:h.client_name||"",
+    items:picked.map((i,idx)=>({
+      sourceItemId:`${h.kp_id||"kp"}-${idx}`,
+      name:i.productName||"Изделие",
+      qty:Number(i.summary?.quantity||1),
+      productImage:firstImage(i.values),
+      sourceValues:i.values||{},
+      contract:"",readyDate:"",planDate:"",status:"Каркас",deliveryAddress:"",
+      fabric:"",dimensions:"",supports:"",seams:"",rigidity:"",
+      decorativeComment:"",decorativeImage:"",
+      pillowComment:"",pillowImage:"",
+      plinthComment:"",plinthImage:"",
+      mechanismComment:"",mechanismImage:"",
+      needMeasure:false,needSockets:false,
+      drawingData:"",drawingName:""
+    }))
+  };
+  state.draftIndex=0;
+  state.modal="order";
+  render();
+}
+
 function startOrder(kpId){
   const kp=state.kp.find(x=>x.id===kpId);
   const selected=[...document.querySelectorAll(`input[data-kp="${CSS.escape(kpId)}"]:checked`)].map(x=>x.dataset.item);
@@ -198,8 +331,33 @@ function startOrder(kpId){
   }))};
   state.draftIndex=0; state.modal="order"; render();
 }
+
+function valueText(v){
+  if(v===null || v===undefined || v==="") return "";
+  if(Array.isArray(v)) return v.filter(Boolean).join(", ");
+  if(typeof v==="object"){
+    if("width" in v || "depth" in v || "height" in v){
+      return [v.width,v.depth,v.height].filter(x=>x!==""&&x!=null).join(" × ");
+    }
+    return "";
+  }
+  return String(v);
+}
+function sourceValue(item, keys){
+  const vals=item.sourceValues||{};
+  for(const key of keys){
+    if(vals[key]!==undefined && vals[key]!==null && vals[key]!=="") return valueText(vals[key]);
+  }
+  return "";
+}
+function prefillFromKp(item){
+  if(!item.fabric) item.fabric=sourceValue(item,["fabric","tkan","cloth","material"]);
+  if(!item.dimensions) item.dimensions=sourceValue(item,["dimensions","size","dimensions_general","overall_dimensions"]);
+  if(!item.supports) item.supports=sourceValue(item,["legs","supports","opory"]);
+  return item;
+}
 function orderModal(){
-  const d=state.draftOrder, i=state.draftIndex, item=d.items[i];
+  const d=state.draftOrder, i=state.draftIndex, item=prefillFromKp(d.items[i]);
   return `<div class="modal-backdrop">
     <div class="modal">
       <div class="modal-head"><h2>${esc(item.name)}</h2><button class="modal-close" onclick="closeModal()">×</button></div>
@@ -334,4 +492,4 @@ function specModal(){
   </div>`;
 }
 load();
-loadKp().finally(render);
+render();
