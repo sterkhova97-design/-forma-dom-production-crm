@@ -1,5 +1,7 @@
 
-const KP_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwSvtr0hpyQjqsm4CEM3ZawXCAsMqJ7Ai2CbAEIwSoQCbQCH_xSRSbmj2lauIgOyygj/exec"; 
+const KP_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzHn02y245jF9svN1YL5YbY-WPs5bs5O_K79TgbB-1ATzu9vzAEnVgVBspQEvDpqWQP/exec"; 
+
+const CRM_API_URL = "https://script.google.com/macros/s/AKfycbwSvtr0hpyQjqsm4CEM3ZawXCAsMqJ7Ai2CbAEIwSoQCbQCH_xSRSbmj2lauIgOyygj/exec";
 // После публикации Google Apps Script сюда вставляется URL вида:
 // https://script.google.com/macros/s/XXXXXXXX/exec
 
@@ -17,18 +19,123 @@ let state = {
   modal:null,
   draftOrder:null,
   draftIndex:0,
-  specItemId:null
+  specItemId:null,
+  crmLoading:true,
+  crmError:"",
+  saving:false
 };
 
 function uid(){ return Math.random().toString(36).slice(2)+Date.now().toString(36); }
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));}
-function load(){
+function loadLegacyLocal(){
   try{
     const saved=JSON.parse(localStorage.getItem(STORAGE_KEY)||"null");
-    if(saved?.items) state.items=saved.items;
-  }catch{}
+    return Array.isArray(saved?.items) ? saved.items : [];
+  }catch{
+    return [];
+  }
 }
-function persist(){ localStorage.setItem(STORAGE_KEY,JSON.stringify({items:state.items})); }
+function clearLegacyLocal(){
+  try{ localStorage.removeItem(STORAGE_KEY); }catch{}
+}
+
+function jsonpFrom(url, params){
+  return new Promise((resolve,reject)=>{
+    const cb="fdcrm_"+Date.now()+"_"+Math.random().toString(36).slice(2);
+    const script=document.createElement("script");
+    const timeout=setTimeout(()=>{
+      cleanup();
+      reject(new Error("Нет ответа от сервера"));
+    },25000);
+
+    function cleanup(){
+      clearTimeout(timeout);
+      try{delete window[cb]}catch{}
+      script.remove();
+    }
+
+    window[cb]=(data)=>{
+      cleanup();
+      if(data && data.ok===false) reject(new Error(data.error||"Ошибка сервера"));
+      else resolve(data);
+    };
+
+    const q=new URLSearchParams({...params,callback:cb,_:Date.now()});
+    script.src=url+(url.includes("?")?"&":"?")+q.toString();
+    script.onerror=()=>{
+      cleanup();
+      reject(new Error("Не удалось загрузить данные"));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+async function crmList(){
+  const data=await jsonpFrom(CRM_API_URL,{action:"crm_list"});
+  return Array.isArray(data?.items)?data.items:[];
+}
+
+async function crmPost(action, payload){
+  const body=JSON.stringify({action,payload});
+  await fetch(CRM_API_URL,{
+    method:"POST",
+    mode:"no-cors",
+    headers:{"Content-Type":"text/plain;charset=utf-8"},
+    body
+  });
+  // no-cors не даёт читать ответ. Даём Apps Script время сохранить данные.
+  await new Promise(r=>setTimeout(r,650));
+  return true;
+}
+
+async function saveServerItem(item){
+  state.saving=true;
+  try{
+    await crmPost("crm_upsert", item);
+  }finally{
+    state.saving=false;
+  }
+}
+
+async function loadCrm(){
+  state.crmLoading=true;
+  state.crmError="";
+  render();
+  try{
+    const serverItems=await crmList();
+    const legacy=loadLegacyLocal();
+
+    // Однократная миграция старых локальных заказов в общую базу.
+    if(legacy.length){
+      const serverIds=new Set(serverItems.map(x=>x.id));
+      const missing=legacy.filter(x=>!serverIds.has(x.id));
+      for(const item of missing){
+        try{ await crmPost("crm_upsert",item); }catch{}
+      }
+      if(missing.length){
+        await new Promise(r=>setTimeout(r,700));
+        state.items=await crmList();
+      }else{
+        state.items=serverItems;
+      }
+      clearLegacyLocal();
+    }else{
+      state.items=serverItems;
+    }
+  }catch(e){
+    state.crmError=e.message||String(e);
+    state.items=[];
+  }finally{
+    state.crmLoading=false;
+    render();
+  }
+}
+function formatDateTime(v){
+  if(!v) return "—";
+  try{
+    return new Intl.DateTimeFormat("ru-RU",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(v));
+  }catch{return String(v)}
+}
 function formatDate(v){
   if(!v) return "—";
   const [y,m,d]=v.split("-");
@@ -59,38 +166,8 @@ function visibleItems(){
   return state.items.filter(x=>state.tab==="archive" ? isArchived(x) : !isArchived(x));
 }
 function jsonp(params){
-  return new Promise((resolve,reject)=>{
-    if(!KP_WEBAPP_URL){
-      reject(new Error("Не указан URL Google Apps Script"));
-      return;
-    }
-    const cb="fdcrm_"+Date.now()+"_"+Math.random().toString(36).slice(2);
-    const script=document.createElement("script");
-    const timeout=setTimeout(()=>{
-      cleanup();
-      reject(new Error("Нет ответа от Google Apps Script"));
-    },20000);
-
-    function cleanup(){
-      clearTimeout(timeout);
-      try{delete window[cb]}catch{}
-      script.remove();
-    }
-
-    window[cb]=(data)=>{
-      cleanup();
-      if(data && data.ok===false) reject(new Error(data.error||"Ошибка Apps Script"));
-      else resolve(data);
-    };
-
-    const q=new URLSearchParams({...params,callback:cb,_:Date.now()});
-    script.src=KP_WEBAPP_URL+(KP_WEBAPP_URL.includes("?")?"&":"?")+q.toString();
-    script.onerror=()=>{
-      cleanup();
-      reject(new Error("Не удалось загрузить данные КП"));
-    };
-    document.head.appendChild(script);
-  });
+  if(!KP_WEBAPP_URL) return Promise.reject(new Error("Не указан URL истории КП"));
+  return jsonpFrom(KP_WEBAPP_URL,params);
 }
 
 async function loadKp(){
@@ -103,7 +180,7 @@ async function loadKp(){
   state.kpError="";
   render();
   try{
-    const data=await jsonp({action:"list"});
+    const data=await jsonp({action:"history_list"});
     state.kp=Array.isArray(data?.items)?data.items:[];
   }catch(e){
     state.kpError=e.message||String(e);
@@ -124,7 +201,7 @@ function render(){
       <div class="crm-top">
         <div class="crm-brand">
           <h1>Forma Dom · Производство</h1>
-          <p>Изделия в работе</p>
+          <p>Изделия в работе <span class="sync-note">${state.saving?"· сохраняю…":"· общая база"}</span></p>
         </div>
         <div class="crm-actions">
           <button class="crm-btn primary" onclick="openKp()">Добавить заказ</button>
@@ -137,7 +214,9 @@ function render(){
       </div>
 
       <section class="crm-card">
-        ${rows.length ? `
+        ${state.crmLoading ? `<div class="empty">Загружаю изделия…</div>` :
+          state.crmError ? `<div class="empty"><strong>Не удалось загрузить общую базу</strong><br><br>${esc(state.crmError)}<br><br><button class="crm-btn" onclick="loadCrm()">Повторить</button></div>` :
+          rows.length ? `
         <div class="crm-table-wrap">
           <table>
             <thead><tr>
@@ -215,10 +294,10 @@ function kpHistoryHtml(){
       </div>
       ${state.kp.map(kp=>`
         <div class="kp-history-row">
-          <div>${esc(kp.created_at||kp.updated_at||"—")}</div>
-          <div><strong>${esc(kp.client_name||kp.kp_name||"Без названия")}</strong>${kp.project_name?`<div class="kp-meta">${esc(kp.project_name)}</div>`:""}</div>
-          <div>${esc(kp.manager||"—")}</div>
-          <div><button class="crm-btn small primary" onclick="openKpDetails('${esc(kp.kp_id)}')">Открыть</button></div>
+          <div>${esc(formatDateTime(kp.createdAt||kp.updatedAt||""))}</div>
+          <div><strong>${esc(kp.clientName||kp.header?.clientName||"Без названия")}</strong>${kp.projectName?`<div class="kp-meta">${esc(kp.projectName)}</div>`:""}</div>
+          <div>${esc(kp.manager||kp.header?.manager||"—")}</div>
+          <div><button class="crm-btn small primary" onclick="openKpDetails('${esc(kp.id)}')">Открыть</button></div>
         </div>`).join("")}
     </div>`;
 }
@@ -228,8 +307,8 @@ async function openKpDetails(kpId){
   state.openedKp={header:{kp_id:kpId},items:[]};
   render();
   try{
-    const data=await jsonp({action:"get",kpId});
-    state.openedKp=data?.kp||null;
+    const data=await jsonp({action:"history_get",id:kpId});
+    state.openedKp=data?.snapshot||null;
     if(!state.openedKp) throw new Error("КП не найдено");
   }catch(e){
     state.openedKp=null;
@@ -255,7 +334,7 @@ function openedKpHtml(){
   return `
     <button class="link-btn" onclick="backToKpHistory()">← Назад к истории КП</button>
     <div class="kp-open-title">
-      <h3>${esc(h.client_name||h.kp_name||"КП")}</h3>
+      <h3>${esc(h.clientName||h.kpName||"КП")}</h3>
       <div class="kp-meta">${esc(h.manager||"")} ${h.project_name?`· ${esc(h.project_name)}`:""}</div>
     </div>
     <div class="progress-note">Выберите изделия, которые нужно передать в производство.</div>
@@ -263,8 +342,8 @@ function openedKpHtml(){
       ${items.map((i,idx)=>`
         <label class="kp-item kp-item-large">
           <input type="checkbox" data-open-item="${idx}">
-          ${firstImage(i.values)?`<img class="product-img" src="${firstImage(i.values)}">`:`<div class="product-img product-placeholder">нет фото</div>`}
-          <span><strong>${esc(i.productName||"Изделие")}</strong><small>${Number(i.summary?.quantity||1)} шт.</small></span>
+          ${(i.image?.dataUrl||firstImage(i.values))?`<img class="product-img" src="${(i.image?.dataUrl||firstImage(i.values))}">`:`<div class="product-img product-placeholder">нет фото</div>`}
+          <span><strong>${esc(i.productName||"Изделие")}</strong><small>${Number(i.quantity||1)} шт.</small></span>
         </label>`).join("")}
     </div>
     <div style="margin-top:18px">
@@ -290,13 +369,13 @@ function startOrderFromOpenedKp(){
   const picked=(kp.items||[]).filter((_,idx)=>indexes.includes(idx));
   const h=kp.header||{};
   state.draftOrder={
-    kpId:h.kp_id||"",
-    client:h.client_name||"",
+    kpId:kp.id||"",
+    client:h.clientName||"",
     items:picked.map((i,idx)=>({
-      sourceItemId:`${h.kp_id||"kp"}-${idx}`,
+      sourceItemId:i.uid||`${kp.id||"kp"}-${idx}`,
       name:i.productName||"Изделие",
-      qty:Number(i.summary?.quantity||1),
-      productImage:firstImage(i.values),
+      qty:Number(i.quantity||1),
+      productImage:(i.image?.dataUrl||firstImage(i.values)),
       sourceValues:i.values||{},
       contract:"",readyDate:"",planDate:"",status:"Каркас",deliveryAddress:"",
       fabric:"",dimensions:"",supports:"",seams:"",rigidity:"",
@@ -438,30 +517,70 @@ function readCommentImage(prefix,inp){
   syncFormToDraft(); const item=state.draftOrder.items[state.draftIndex], f=inp.files[0];
   fileToData(f,data=>{item[prefix+"Image"]=data;render();});
 }
-function saveAndNext(){
+async function saveAndNext(){
   syncFormToDraft();
   const item=state.draftOrder.items[state.draftIndex];
   if(!item.contract){toast("Введите № договора");return;}
   if(!item.readyDate){toast("Введите дату готовности");return;}
+
   if(state.draftIndex < state.draftOrder.items.length-1){
     const next=state.draftOrder.items[state.draftIndex+1];
     if(!next.contract) next.contract=item.contract;
     if(!next.deliveryAddress) next.deliveryAddress=item.deliveryAddress;
-    state.draftIndex++; render(); return;
+    state.draftIndex++;
+    render();
+    return;
   }
+
   const created=state.draftOrder.items.map(x=>({...x,id:uid(),kpId:state.draftOrder.kpId}));
-  state.items.push(...created); persist(); state.modal=null; state.draftOrder=null; render();
-  toast("Заказ добавлен в производство");
+  toast("Сохраняю заказ…");
+
+  try{
+    for(const x of created) await saveServerItem(x);
+    state.items=await crmList();
+    state.modal=null;
+    state.draftOrder=null;
+    render();
+    toast("Заказ добавлен в общую базу");
+  }catch(e){
+    console.error(e);
+    toast("Не удалось сохранить заказ");
+  }
 }
 function findItem(id){return state.items.find(x=>x.id===id);}
-function changeStatus(id,value){
-  const item=findItem(id); item.status=value; persist(); render();
-  if(value==="Отгружен"){
+async function changeStatus(id,value){
+  const item=findItem(id);
+  if(!item) return;
+  const old=item.status;
+  item.status=value;
+  render();
+
+  try{
+    await saveServerItem(item);
     const all=state.items.filter(x=>x.contract===item.contract);
-    if(all.every(x=>x.status==="Отгружен")) toast("Все изделия договора отгружены — договор перенесён в архив");
+    if(value==="Отгружен" && all.length && all.every(x=>x.status==="Отгружен")){
+      toast("Все изделия договора отгружены — договор перенесён в архив");
+    }
+  }catch(e){
+    item.status=old;
+    render();
+    toast("Не удалось сохранить статус");
   }
 }
-function changePlanDate(id,value){const item=findItem(id);item.planDate=value;persist();render();}
+async function changePlanDate(id,value){
+  const item=findItem(id);
+  if(!item) return;
+  const old=item.planDate;
+  item.planDate=value;
+  render();
+  try{
+    await saveServerItem(item);
+  }catch(e){
+    item.planDate=old;
+    render();
+    toast("Не удалось сохранить дату");
+  }
+}
 function openDrawing(id){
   const item=findItem(id); if(!item?.drawingData)return;
   const w=window.open();
@@ -483,7 +602,13 @@ function specModal(){
       <div class="modal-head no-print"><h2>Характеристики изделия</h2><div style="display:flex;gap:8px"><button class="crm-btn small primary" onclick="window.print()">Распечатать A4</button><button class="modal-close" onclick="closeModal()">×</button></div></div>
       <div class="modal-body" id="print-area">
         <div class="print-sheet">
-          <div class="print-title"><div><h2>${esc(x.name)}</h2><div>Forma Dom · Производственное ТЗ</div></div><div><strong>Договор ${esc(x.contract)}</strong><br>${formatDate(x.readyDate)}</div></div>
+          <div class="print-title">
+            <div class="print-title-main">
+              ${x.productImage?`<img class="spec-product-image" src="${x.productImage}" alt="${esc(x.name)}">`:""}
+              <div><h2>${esc(x.name)}</h2><div>Forma Dom · Производственное ТЗ</div></div>
+            </div>
+            <div><strong>Договор ${esc(x.contract)}</strong><br>${formatDate(x.readyDate)}</div>
+          </div>
           <div class="spec-grid">${specs.map(s=>`<div class="spec-key">${esc(s[0])}</div><div>${esc(s[1]||"—")}</div>`).join("")}</div>
           ${imgs.length?`<div class="spec-images">${imgs.map(i=>`<div><strong>${esc(i[0])}</strong><img src="${i[1]}"></div>`).join("")}</div>`:""}
         </div>
@@ -491,5 +616,5 @@ function specModal(){
     </div>
   </div>`;
 }
-load();
 render();
+loadCrm();
